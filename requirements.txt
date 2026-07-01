@@ -1,0 +1,5 @@
+# Pinned for stability. garminconnect 0.3.x uses the curl_cffi transport that defeats
+# Garmin's Cloudflare TLS fingerprinting; avoid an unvetted 0.4 jump auto-upgrading.
+garminconnect>=0.3.6,<0.4
+mcp>=1.12,<2
+uvicorn>=0.30
