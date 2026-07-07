@@ -230,8 +230,13 @@ def _activate_and_report(g: Garmin) -> str:
     user can persist it into the GARMIN_TOKENS env var (survives restarts)."""
     global _client, _token
     token = g.client.dumps()
+    # The MFA resume path can skip the profile fetch, leaving display_name unset —
+    # which breaks endpoints (steps, body battery) that build URLs from it. Load it
+    # explicitly so the live session works immediately, not just after a restart.
     name = None
     try:
+        if not getattr(g, "display_name", None):
+            g._load_profile_and_settings()
         name = g.get_full_name()
     except Exception:  # noqa: BLE001
         pass
