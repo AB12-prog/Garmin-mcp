@@ -26,7 +26,10 @@ Workouts you create land on Garmin Connect's calendar; you then **sync your watc
 receive them.
 
 There is **no "connect Garmin" button** like WHOOP has — Garmin has no individual OAuth.
-Instead the account owner authenticates once and a token blob is stored as an env var.
+Instead the account owner signs in once (from Claude, or with `auth_setup.py`) and the
+server keeps the token on a **Railway volume**. Garmin rotates the refresh token every
+time the session refreshes, so the server re-saves it each time; that is what keeps you
+signed in across restarts.
 
 ---
 
@@ -47,19 +50,32 @@ It prints a long **token blob**. Copy it.
 1. Push this folder to a GitHub repo (or `railway up`).
 2. New Railway project from the repo. Nixpacks auto-detects Python and installs
    `requirements.txt`.
-3. Add two **Variables**:
+3. **Attach a volume** to the service, mount path `/data` (right-click the service →
+   *Attach volume*). This is required for sign-ins to survive restarts.
+4. Add **Variables**:
    - `GARMIN_MCP_SECRET` = a long, URL-safe random string
      (`python -c "import secrets; print(secrets.token_urlsafe(32))"`).
-   - `GARMIN_TOKENS` = the blob from Step 1 (single line, no quotes).
-4. Railway sets `PORT` automatically. Under **Settings → Networking**, generate a public
+   - `LOCAL_TIMEZONE` (recommended) = your IANA zone, e.g. `Australia/Brisbane`, so
+     "today" and weigh-in times use your day rather than UTC.
+   - `GARMIN_TOKENS` (optional) = the blob from Step 1. Only used to seed the volume on
+     first boot; skip it if you'll sign in from Claude instead.
+5. Railway sets `PORT` automatically. Under **Settings → Networking**, generate a public
    domain. Your endpoint is:
 
    ```
    https://<your-app>.up.railway.app/<GARMIN_MCP_SECRET>/mcp
    ```
 
-No volume or database needed — the server is a stateless pass-through; the token blob in
-the env var is the only stored state. A `GET /health` route returns `{"status":"ok"}` if
+Stored on the volume:
+- `/data/garmin_tokens.json` — the live Garmin token (override with `GARMIN_TOKEN_PATH`).
+- `/data/garmin.db` — a local copy of your Garmin data (override with `GARMIN_DB_PATH`).
+  The server refreshes today and yesterday every hour in the background, and backfills
+  the last 30 days after you first sign in, so tools answer from it in milliseconds
+  instead of waiting on Garmin. Older days come from the store; anything not stored yet
+  is fetched once and kept.
+
+Without a volume, sign-ins last only until the next restart and the data copy is rebuilt
+each time. No separate cron service is needed — the hourly refresh runs inside the server. A `GET /health` route returns `{"status":"ok"}` if
 you want a Railway healthcheck.
 
 ## Step 3 — Add to Claude
@@ -68,13 +84,13 @@ In Claude (**Pro/Max required** for custom connectors): **Settings → Connector
 custom connector**. Paste the full `https://…/<SECRET>/mcp` URL. No OAuth — the secret
 path is the gate. Verify with `garmin_whoami`.
 
-## Refreshing the token later (~yearly)
+## Signing in / reconnecting
 
-The token auto-refreshes and lasts about a year. If it ever expires, either re-run
-`auth_setup.py` and update `GARMIN_TOKENS`, or — fully from the app — tell Claude to
-reconnect: it calls `garmin_auth_start` (Garmin sends an MFA code) then
-`garmin_auth_complete`. That returns a fresh blob; paste it back into `GARMIN_TOKENS` in
-Railway so it survives the next restart.
+From Claude: "connect my Garmin" → `garmin_auth_start` (email + password) → if Garmin
+sends a code, `garmin_auth_complete`. The token is saved to the volume automatically —
+nothing to copy. `garmin_auth_status` shows whether sign-ins persist
+(`sign_in_persists: true` means the volume is working). You should only need to do this
+again if you change your Garmin password or revoke access.
 
 ---
 
@@ -100,8 +116,8 @@ Single deployment = single Garmin account. To let (say) a sibling use it on your
 - **The URL is the credential.** Anyone with `https://…/<SECRET>/mcp` has full access to
   the connected account. Share it privately; rotate by changing `GARMIN_MCP_SECRET`.
 - **Logs.** Access logging is set to WARNING so the secret-bearing path isn't logged.
-- **The token blob is sensitive** (a live session credential). Keep it in the env var;
-  never commit it. `.gitignore` covers local files.
+- **The token is sensitive** (a live session credential). It lives in the volume file
+  (owner-only permissions) and optionally the `GARMIN_TOKENS` seed; never commit it.
 - **Fragility.** Garmin periodically changes auth; the library is a moving target. If
   logins fail, bump `garminconnect` locally, re-mint, redeploy. Deps are pinned to the
   tested 0.3.x line to avoid a surprise breaking upgrade.
@@ -111,6 +127,10 @@ Single deployment = single Garmin account. To let (say) a sibling use it on your
 ## Tools
 
 **Auth** — `garmin_auth_status`, `garmin_auth_start`, `garmin_auth_complete`
+
+**Summaries (instant, from the local store)** — `garmin_today` (readiness, sleep, HRV,
+RHR, Body Battery, stress, steps, training load), `garmin_trends` (day-by-day table with
+averages), `garmin_sync` (refresh now, or `days` to backfill history)
 
 **Read** — `garmin_whoami`, `garmin_daily_summary`, `garmin_sleep`, `garmin_hrv`,
 `garmin_training_readiness`, `garmin_training_status`, `garmin_body_battery`,
@@ -146,7 +166,8 @@ builder can't express (e.g. a different sport).
 - **Fragility.** Garmin periodically changes its auth; the library is a moving target. If
   logins start failing, `pip install -U garminconnect` locally, re-run `auth_setup.py`,
   and redeploy. Pin a known-good version in `requirements.txt` if you want stability.
-- **Token expiry (~1 year).** Re-run Step 1 and update `GARMIN_TOKENS`.
+- **Re-sign-in** is only needed after a password change or revoked access — sign in again
+  from Claude.
 
 ## Local run (optional)
 

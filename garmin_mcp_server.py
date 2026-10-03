@@ -9,11 +9,14 @@ Auth model
 ----------
 Garmin has no self-serve individual API, so this server authenticates AS the account
 owner using the maintained `garminconnect` library (0.3.x, curl_cffi transport). Provide
-a long-lived token blob via the GARMIN_TOKENS env var (mint it once with auth_setup.py).
-The token auto-refreshes and lasts ~1 year. If it ever expires you can re-mint locally,
-or use the in-app tools (garmin_auth_start / garmin_auth_complete), which return a fresh
-blob to paste back into GARMIN_TOKENS. The server keeps no database — it is a stateless
-pass-through, and the only persisted secret is that env var.
+a token, either by signing in from Claude (garmin_auth_start / garmin_auth_complete) or by
+seeding the GARMIN_TOKENS env var once (mint it with auth_setup.py).
+
+Garmin rotates the refresh token every time the session refreshes, so the *current* token
+must be saved each time it changes — otherwise a restart reloads a used-up token and the
+user has to sign in again. The server therefore keeps the live token in a file on a Railway
+volume (GARMIN_TOKEN_PATH, default /data/garmin_tokens.json), loads it on boot, and lets
+the library re-save it on every refresh. GARMIN_TOKENS is only a first-boot seed.
 
 Connector security
 ------------------
@@ -29,10 +32,13 @@ from __future__ import annotations
 import json
 import os
 import threading
-from datetime import date, datetime
+import time
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from garminconnect import Garmin
+
+from cache import FRESH_MINUTES, Store, Syncer
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -42,8 +48,20 @@ from starlette.responses import JSONResponse
 # --------------------------------------------------------------------------- #
 PORT = int(os.getenv("PORT", "8000"))
 SECRET = os.getenv("GARMIN_MCP_SECRET", "").strip()
-# Primary auth: a token blob minted with auth_setup.py (or refreshed via the auth tools).
+# First-boot seed only: a token blob minted with auth_setup.py. The live token is kept in
+# TOKEN_PATH, because Garmin rotates refresh tokens and a static env blob goes stale.
 ENV_TOKENS = os.getenv("GARMIN_TOKENS", "").strip()
+# Where the live token is persisted. Point it at a Railway volume so it survives restarts.
+TOKEN_PATH = os.getenv("GARMIN_TOKEN_PATH", "").strip() or (
+    "/data/garmin_tokens.json" if os.path.isdir("/data") else ""
+)
+# Local data store (same volume). Without a volume it falls back to memory: still fast
+# within a process, but rebuilt after each restart.
+DB_PATH = os.getenv("GARMIN_DB_PATH", "").strip() or (
+    "/data/garmin.db" if os.path.isdir("/data") else ":memory:"
+)
+# Optional IANA zone (e.g. "Australia/Brisbane") so "today" means the user's day, not UTC.
+LOCAL_TZ = os.getenv("LOCAL_TIMEZONE", "").strip()
 
 if not SECRET:
     # Fail loudly rather than silently exposing an open endpoint to health data.
@@ -89,10 +107,62 @@ class NotAuthenticated(Exception):
 
 
 _client: Garmin | None = None
-_token: str = ENV_TOKENS
-_pending: dict[str, Any] = {}  # holds Garmin instance + client_state between MFA steps
+_pending: dict[str, Any] = {}  # holds the Garmin instance between MFA steps
 _state_lock = threading.Lock()  # guards _client / _token / _pending mutations
 _call_lock = threading.RLock()  # serializes access to the (non-thread-safe) HTTP client
+
+
+def _persistent() -> bool:
+    """True when a writable token file is configured (i.e. sign-ins survive restarts)."""
+    if not TOKEN_PATH:
+        return False
+    try:
+        os.makedirs(os.path.dirname(TOKEN_PATH) or ".", exist_ok=True)
+        return os.access(os.path.dirname(TOKEN_PATH) or ".", os.W_OK)
+    except OSError:
+        return False
+
+
+def _read_token_file() -> str:
+    if TOKEN_PATH and os.path.isfile(TOKEN_PATH):
+        try:
+            with open(TOKEN_PATH, encoding="utf-8") as fh:
+                return fh.read().strip()
+        except OSError:
+            return ""
+    return ""
+
+
+def _initial_token() -> str:
+    """Saved token first (it is the most recent); fall back to the env seed."""
+    return _read_token_file() or ENV_TOKENS
+
+
+_token: str = _initial_token()
+
+
+def _bind_persistence(g: Garmin) -> None:
+    """Save the client's current token and have the library re-save it on every refresh."""
+    if not _persistent():
+        return
+    try:
+        g.client._tokenstore_path = TOKEN_PATH  # library auto-dumps here after refreshes
+        g.client.dump(TOKEN_PATH)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[garmin] could not persist token: {type(exc).__name__}", flush=True)
+
+
+def _remember(g: Garmin) -> None:
+    """Keep the in-memory copy of the token current (it rotates on refresh), so a
+    reconnect never falls back to a used-up token even without a volume."""
+    global _token
+    try:
+        current = g.client.dumps()
+    except Exception:  # noqa: BLE001
+        return
+    if current and current != _token:
+        with _state_lock:
+            _token = current
 
 
 def _connect() -> Garmin:
@@ -103,39 +173,74 @@ def _connect() -> Garmin:
             "with garmin_auth_complete."
         )
     client = Garmin()
-    client.login(_token)  # login() accepts the token blob directly when > 512 chars
+    client.login(_token)  # accepts the token JSON directly
+    _bind_persistence(client)
+    _remember(client)
     return client
 
 
 def gc() -> Garmin:
     global _client
     with _state_lock:
-        if _client is None:
-            _client = _connect()
-        return _client
+        client = _client
+    if client is None:
+        client = _connect()
+        with _state_lock:
+            _client = client
+    return client
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    msg = f"{type(exc).__name__} {exc}".lower()
+    return any(k in msg for k in ("401", "unauthorized", "authentication", "token", "login"))
 
 
 def _call(fn_name: str, *args: Any, **kwargs: Any) -> Any:
-    """Call a Garmin client method under a serializing lock, retrying once with a fresh
-    login on auth errors. Serialization protects the shared curl_cffi session from
-    concurrent tool calls."""
-    global _client
+    """Call a Garmin client method under a serializing lock. On an auth error, rebuild
+    the client once from the newest saved token. Serialization protects the shared
+    curl_cffi session from concurrent tool calls."""
+    global _client, _token
     with _call_lock:
         try:
-            return getattr(gc(), fn_name)(*args, **kwargs)
+            client = gc()
+            result = getattr(client, fn_name)(*args, **kwargs)
+            _remember(client)
+            return result
         except NotAuthenticated:
             raise
         except Exception as exc:  # noqa: BLE001
-            msg = str(exc).lower()
-            if any(k in msg for k in ("401", "unauthorized", "token", "login", "auth")):
-                with _state_lock:
-                    _client = None
-                return getattr(gc(), fn_name)(*args, **kwargs)
-            raise
+            if not _is_auth_error(exc):
+                raise
+            with _state_lock:
+                _client = None
+                _token = _read_token_file() or _token
+            try:
+                client = gc()
+                result = getattr(client, fn_name)(*args, **kwargs)
+                _remember(client)
+                return result
+            except Exception as exc2:  # noqa: BLE001
+                if _is_auth_error(exc2):
+                    raise NotAuthenticated(
+                        "The Garmin session has expired. Sign in again with "
+                        "garmin_auth_start (and garmin_auth_complete if Garmin sends a code)."
+                    ) from exc2
+                raise
 
 
 def _today() -> str:
+    if LOCAL_TZ:
+        try:
+            from zoneinfo import ZoneInfo
+
+            return datetime.now(ZoneInfo(LOCAL_TZ)).date().isoformat()
+        except Exception:  # noqa: BLE001 — bad zone name or no tzdata: fall back
+            pass
     return date.today().isoformat()
+
+
+store = Store(DB_PATH)
+syncer = Syncer(store, lambda name, *a, **k: _call(name, *a, **k), lambda: _today())
 
 
 def _dump(obj: Any, max_chars: int = 60_000) -> str:
@@ -153,23 +258,31 @@ def _dump(obj: Any, max_chars: int = 60_000) -> str:
 def garmin_auth_status() -> str:
     """Report whether the server is connected to a Garmin account (and whose). Call this
     first if other tools report the server isn't authenticated."""
+    persistent = _persistent()
     if not _token:
         return _dump(
             {
                 "authenticated": False,
+                "sign_in_persists": persistent,
                 "hint": "Call garmin_auth_start with the account owner's Garmin email "
                 "and password to connect.",
             }
         )
     try:
         name = _call("get_full_name")
+    except NotAuthenticated as exc:
+        return _dump({"authenticated": False, "sign_in_persists": persistent, "hint": str(exc)})
     except Exception as exc:  # noqa: BLE001
         return _dump({"authenticated": True, "warning": f"token present but test call failed: {exc}"})
     return _dump(
         {
             "authenticated": True,
             "account": name,
-            "persisted": bool(ENV_TOKENS),  # True only if backed by the GARMIN_TOKENS env var
+            "sign_in_persists": persistent,
+            **({} if persistent else {
+                "warning": "No token volume configured: this sign-in is lost on the next "
+                "restart. Attach a Railway volume at /data."
+            }),
         }
     )
 
@@ -186,13 +299,13 @@ def garmin_auth_start(email: str, password: str) -> str:
     global _pending
     try:
         g = Garmin(email, password, return_on_mfa=True)
-        status, client_state = g.login()
+        status, _ = g.login()
     except Exception as exc:  # noqa: BLE001
         return _dump({"ok": False, "error": str(exc)})
 
-    if status:  # MFA required — hold this session for the completion step
+    if status == "needs_mfa":  # hold this session (its MFA state lives on the instance)
         with _state_lock:
-            _pending = {"garmin": g, "state": client_state}
+            _pending = {"garmin": g}
         return _dump(
             {
                 "ok": True,
@@ -211,14 +324,15 @@ def garmin_auth_complete(mfa_code: str) -> str:
     Only needed after garmin_auth_start reported mfa_required."""
     global _pending
     with _state_lock:
-        pending = dict(_pending)
-    g = pending.get("garmin")
-    state = pending.get("state")
-    if not g or state is None:
+        g = _pending.get("garmin")
+    if not g:
         return _dump({"ok": False, "error": "No pending login. Call garmin_auth_start first."})
     try:
-        g.resume_login(state, mfa_code.strip())
+        # Recent garminconnect keeps the MFA state on the instance and ignores this
+        # argument; older versions returned it from login(). Passing {} works for both.
+        g.resume_login({}, mfa_code.strip().replace(" ", ""))
     except Exception as exc:  # noqa: BLE001
+        # A wrong code leaves the pending session usable for another try.
         return _dump({"ok": False, "error": f"MFA verification failed: {exc}"})
     with _state_lock:
         _pending = {}
@@ -226,13 +340,11 @@ def garmin_auth_complete(mfa_code: str) -> str:
 
 
 def _activate_and_report(g: Garmin) -> str:
-    """Make a freshly logged-in client the active one and return the token blob so the
-    user can persist it into the GARMIN_TOKENS env var (survives restarts)."""
+    """Make a freshly logged-in client the active one and save its token, so the
+    sign-in survives restarts and the user never has to paste anything."""
     global _client, _token
-    token = g.client.dumps()
-    # The MFA resume path can skip the profile fetch, leaving display_name unset —
-    # which breaks endpoints (steps, body battery) that build URLs from it. Load it
-    # explicitly so the live session works immediately, not just after a restart.
+    # The return_on_mfa login path skips the profile fetch, leaving display_name unset —
+    # which breaks endpoints (steps, body battery) that build URLs from it.
     name = None
     try:
         if not getattr(g, "display_name", None):
@@ -240,17 +352,38 @@ def _activate_and_report(g: Garmin) -> str:
         name = g.get_full_name()
     except Exception:  # noqa: BLE001
         pass
+    g.password = None
+    token = g.client.dumps()
+    _bind_persistence(g)
     with _state_lock:
         _token = token
         _client = g
+    # Pull today/yesterday straight away so the first questions answer from the store.
+    threading.Thread(target=_safe_sync, name="garmin-post-login-sync", daemon=True).start()
+
+    if _persistent():
+        return _dump(
+            {
+                "ok": True,
+                "connected": True,
+                "account": name,
+                "saved": True,
+                "note": "Signed in and saved on the server; it stays connected across "
+                "restarts. Nothing to copy.",
+            }
+        )
+    # Without a volume the only way to survive a restart is the env var, so hand the
+    # token back — but say plainly that a volume is the real fix.
     return _dump(
         {
             "ok": True,
             "connected": True,
             "account": name,
+            "saved": False,
             "token": token,
-            "action_required": "To survive server restarts, paste this token as the "
-            "GARMIN_TOKENS variable in Railway. Until then it lives in memory only.",
+            "action_required": "No token volume is configured, so this sign-in is lost on "
+            "the next restart. Fix: attach a Railway volume mounted at /data (the server "
+            "then saves the token itself). Stopgap: paste this token into GARMIN_TOKENS.",
         }
     )
 
@@ -270,69 +403,216 @@ def garmin_whoami() -> str:
 def garmin_daily_summary(cdate: str | None = None) -> str:
     """All-day summary for a date (default today): steps, calories, resting HR, stress,
     body battery, intensity minutes and body-composition snapshot. cdate = 'YYYY-MM-DD'."""
-    return _dump(_call("get_stats_and_body", cdate or _today()))
+    return _dump(syncer.daily(cdate or _today(), "summary"))
 
 
 @mcp.tool()
 def garmin_sleep(cdate: str | None = None) -> str:
     """Sleep detail for the night ending on cdate (default today): duration, stages
     (deep/light/REM/awake), sleep score, respiration and overnight HRV where available."""
-    return _dump(_call("get_sleep_data", cdate or _today()))
+    return _dump(syncer.daily(cdate or _today(), "sleep"))
 
 
 @mcp.tool()
 def garmin_hrv(cdate: str | None = None) -> str:
     """Overnight HRV data for a date (default today): last-night average, weekly average,
     status and the per-reading series. cdate = 'YYYY-MM-DD'."""
-    return _dump(_call("get_hrv_data", cdate or _today()))
+    return _dump(syncer.daily(cdate or _today(), "hrv"))
 
 
 @mcp.tool()
 def garmin_training_readiness(cdate: str | None = None) -> str:
     """Training Readiness score and its inputs (sleep, recovery time, HRV, acute load)
     for a date (default today)."""
-    return _dump(_call("get_training_readiness", cdate or _today()))
+    return _dump(syncer.daily(cdate or _today(), "readiness"))
 
 
 @mcp.tool()
 def garmin_training_status(cdate: str | None = None) -> str:
     """Training Status for a date (default today): load balance, VO2 max estimate, acute
     and chronic load, and status label (productive/maintaining/detraining/etc.)."""
-    return _dump(_call("get_training_status", cdate or _today()))
+    return _dump(syncer.daily(cdate or _today(), "training_status"))
 
 
 @mcp.tool()
 def garmin_body_battery(startdate: str, enddate: str | None = None) -> str:
     """Body Battery series between two dates (inclusive). Dates = 'YYYY-MM-DD'.
     Omit enddate for a single day."""
-    return _dump(_call("get_body_battery", startdate, enddate))
+    end = enddate or startdate
+    try:
+        d0, d1 = date.fromisoformat(startdate), date.fromisoformat(end)
+    except ValueError:
+        return _dump({"error": "dates must be YYYY-MM-DD"})
+    if d1 < d0 or (d1 - d0).days > 62:
+        return _dump(_call("get_body_battery", startdate, enddate))
+    out: list[Any] = []
+    for n in range((d1 - d0).days + 1):
+        day = (d0 + timedelta(days=n)).isoformat()
+        part = syncer.daily(day, "body_battery")
+        out.extend(part if isinstance(part, list) else [part])
+    return _dump(out)
 
 
 @mcp.tool()
 def garmin_stress(cdate: str | None = None) -> str:
     """All-day stress breakdown for a date (default today): rest/low/medium/high minutes
     and average stress level."""
-    return _dump(_call("get_all_day_stress", cdate or _today()))
+    return _dump(syncer.daily(cdate or _today(), "stress"))
 
 
 @mcp.tool()
 def garmin_recent_activities(limit: int = 10, activitytype: str | None = None) -> str:
     """Most recent activities (default 10). Optional activitytype filter, e.g. 'running',
     'strength_training', 'cycling'. Returns summary metrics per activity."""
-    return _dump(_call("get_activities", 0, limit, activitytype))
+    last = store.get_meta("last_activities_fetch", 0) or 0
+    if time.time() - last < FRESH_MINUTES * 60 and limit <= 30:
+        cached = store.recent_activities(limit, activitytype)
+        if cached:
+            return _dump(cached)
+    try:
+        items = _call("get_activities", 0, limit, activitytype) or []
+    except Exception:
+        cached = store.recent_activities(limit, activitytype)
+        if cached:
+            return _dump(cached)
+        raise
+    store.put_activities(items)
+    if not activitytype:
+        store.set_meta("last_activities_fetch", time.time())
+    return _dump(items)
 
 
 @mcp.tool()
 def garmin_activity_detail(activity_id: str, include_sets: bool = True) -> str:
     """Full detail for one activity by id, including per-set exercise data for strength
     sessions (reps, weight, exercise category) when include_sets is true."""
+    cached = store.get_detail(activity_id)
+    if cached and (cached.get("exercise_sets") is not None or not include_sets):
+        return _dump(cached)
     out: dict[str, Any] = {"activity": _call("get_activity", activity_id)}
     if include_sets:
         try:
             out["exercise_sets"] = _call("get_activity_exercise_sets", activity_id)
         except Exception as exc:  # noqa: BLE001
             out["exercise_sets_error"] = str(exc)
+    if "exercise_sets_error" not in out:
+        store.put_detail(activity_id, out)  # finished activities don't change
     return _dump(out)
+
+
+# --- Summary tools over the local store (fast; mirror the health server's) ---- #
+def _fmt_h(seconds: Any) -> str:
+    if not isinstance(seconds, (int, float)):
+        return "—"
+    return f"{int(seconds // 3600)}h {int(round(seconds % 3600 / 60)):02d}m"
+
+
+def _f(v: Any, digits: int = 0) -> str:
+    return f"{v:.{digits}f}" if isinstance(v, (int, float)) else "—"
+
+
+def _pretty(v: Any) -> str:
+    return v.replace("_", " ").lower() if isinstance(v, str) else "—"
+
+
+def _ensure_days(days: list[str]) -> None:
+    """Fill any of these days that aren't stored yet (uses stored copies where fresh)."""
+    for day in days:
+        for source in ("summary", "sleep", "hrv", "readiness", "training_status"):
+            try:
+                syncer.daily(day, source)
+            except NotAuthenticated:
+                raise
+            except Exception:  # noqa: BLE001 — a missing metric shouldn't sink the summary
+                pass
+
+
+@mcp.tool()
+def garmin_today() -> str:
+    """Today's snapshot: training readiness, last night's sleep (score, stages), overnight
+    HRV vs baseline, resting HR, Body Battery, stress, steps, training status/load. Use
+    this for 'how am I today / should I train' questions."""
+    today = _today()
+    _ensure_days([today])
+    rows = store.daily_range(today, today)
+    if not rows:
+        return "No Garmin data for today yet."
+    r = rows[0]
+    out = [f"# Garmin — {today}", ""]
+    out.append(f"**Readiness:** {_f(r['readiness_score'])} ({_pretty(r['readiness_level'])})"
+               + (f" · {_pretty(r['readiness_feedback'])}" if r["readiness_feedback"] else ""))
+    out.append(f"**Sleep:** {_fmt_h(r['sleep_s'])} · score {_f(r['sleep_score'])} ({_pretty(r['sleep_quality'])}) — "
+               f"deep {_fmt_h(r['deep_s'])}, light {_fmt_h(r['light_s'])}, REM {_fmt_h(r['rem_s'])}, awake {_fmt_h(r['awake_s'])}")
+    out.append(f"**HRV:** {_f(r['hrv_last_night'])} ms (7-day {_f(r['hrv_weekly'])}, baseline "
+               f"{_f(r['hrv_baseline_low'])}–{_f(r['hrv_baseline_high'])}) · {_pretty(r['hrv_status'])}")
+    out.append(f"**Resting HR:** {_f(r['resting_hr'])} bpm · **Body Battery:** wake {_f(r['bb_wake'])}, "
+               f"high {_f(r['bb_high'])}, low {_f(r['bb_low'])}")
+    out.append(f"**Stress avg:** {_f(r['stress_avg'])} · **Steps:** {_f(r['steps'])} · **Active kcal:** {_f(r['active_kcal'])}")
+    if r["training_status"] or r["load_acute"] is not None:
+        out.append(f"**Training:** {_pretty(r['training_status'])} · acute {_f(r['load_acute'])} / chronic "
+                   f"{_f(r['load_chronic'])} (ratio {_f(r['acwr'], 2)})"
+                   + (f" · VO2 max {_f(r['vo2max'], 1)}" if r["vo2max"] else ""))
+    return "\n".join(out)
+
+
+@mcp.tool()
+def garmin_trends(days: int = 14) -> str:
+    """Day-by-day trends with averages: readiness, overnight HRV, resting HR, sleep
+    duration and score, Body Battery high, stress, steps. days = 1-365 (default 14).
+    Long ranges answer instantly once garmin_sync has backfilled them."""
+    days = max(1, min(int(days), 365))
+    t = date.fromisoformat(_today())
+    span = [(t - timedelta(days=n)).isoformat() for n in range(days)]
+    have = {r["date"] for r in store.daily_range(span[-1], span[0])}
+    recent = (t - timedelta(days=1)).isoformat()
+    # Today/yesterday are kept fresh by the hourly sync; only older gaps need fetching.
+    missing = [d for d in span if d not in have or d >= recent]
+    gaps = [d for d in missing if d < recent]
+    if len(gaps) > 3:
+        syncer.start_backfill(days)
+        return (f"{len(gaps)} of those days aren't stored yet, so I've started a background "
+                f"backfill (~{len(gaps) * 8 // 60 + 1} min). Showing what's stored now; ask again shortly.\n\n"
+                + _trends_table(store.daily_range(span[-1], span[0]), days))
+    _ensure_days(missing)
+    return _trends_table(store.daily_range(span[-1], span[0]), days)
+
+
+def _trends_table(rows: list[dict[str, Any]], days: int) -> str:
+    if not rows:
+        return "No stored data for that range yet."
+    lines = [f"# Garmin trends — last {days} days", "",
+             "| Date | Ready | HRV | RHR | Sleep | Score | BB high | Stress | Steps |",
+             "|---|---|---|---|---|---|---|---|---|"]
+    for r in rows:
+        lines.append(f"| {r['date']} | {_f(r['readiness_score'])} | {_f(r['hrv_last_night'])} | {_f(r['resting_hr'])} | "
+                     f"{_fmt_h(r['sleep_s'])} | {_f(r['sleep_score'])} | {_f(r['bb_high'])} | {_f(r['stress_avg'])} | {_f(r['steps'])} |")
+
+    def avg(k: str) -> float | None:
+        v = [r[k] for r in rows if isinstance(r[k], (int, float))]
+        return sum(v) / len(v) if v else None
+
+    lines.append("")
+    lines.append(f"**Averages:** readiness {_f(avg('readiness_score'))} · HRV {_f(avg('hrv_last_night'))} ms · "
+                 f"RHR {_f(avg('resting_hr'))} · sleep {_fmt_h(avg('sleep_s'))} (score {_f(avg('sleep_score'))}) · "
+                 f"stress {_f(avg('stress_avg'))} · steps {_f(avg('steps'))}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def garmin_sync(days: int | None = None) -> str:
+    """Refresh stored Garmin data. No days: refresh today/yesterday now and report status.
+    days > 2: start a background backfill of that many days (max 730) so trends and older
+    dates answer instantly; call again with no days to see progress."""
+    if days and days > 2:
+        st = syncer.start_backfill(min(int(days), 730))
+        return _dump({"backfill": st, "note": "Runs in the background (~8 s per day). Call garmin_sync with no days to check progress."})
+    bf = syncer.backfill
+    if bf.get("running"):
+        return _dump({"backfill": bf, "note": "Backfill running; stored data is usable meanwhile."})
+    result = syncer.sync_recent()
+    lo, hi = store.stored_range()
+    return _dump({"synced": result, "stored_range": [lo, hi], "last_backfill": bf if bf.get("total") else None,
+                  "store": "volume" if DB_PATH != ":memory:" else "memory (attach a /data volume to keep it)"})
 
 
 @mcp.tool()
@@ -345,9 +625,35 @@ def garmin_weight_trend(startdate: str, enddate: str | None = None) -> str:
 @mcp.tool()
 def garmin_log_weight(weight_kg: float, when: str | None = None) -> str:
     """Log a manual weigh-in to Garmin Connect. weight_kg in kilograms; 'when' optional
-    ISO datetime 'YYYY-MM-DDTHH:MM:SS' (defaults to now). Returns the created record."""
-    ts = when or datetime.now().isoformat()
-    return _dump(_call("add_weigh_in", weight_kg, "kg", ts))
+    local ISO datetime 'YYYY-MM-DDTHH:MM:SS' (defaults to now). Returns the created record."""
+    from datetime import timezone
+
+    tz = None
+    if LOCAL_TZ:
+        try:
+            from zoneinfo import ZoneInfo
+
+            tz = ZoneInfo(LOCAL_TZ)
+        except Exception:  # noqa: BLE001
+            tz = None
+    try:
+        local = datetime.fromisoformat(when) if when else datetime.now(tz)
+    except ValueError:
+        return _dump({"error": "when must be 'YYYY-MM-DDTHH:MM:SS'"})
+    if local.tzinfo is None:
+        local = local.replace(tzinfo=tz) if tz else local.astimezone()
+    gmt = local.astimezone(timezone.utc)
+    # Explicit local + GMT stamps: the library's own conversion uses the server's
+    # clock zone (UTC on Railway), which would shift the weigh-in by the UTC offset.
+    return _dump(
+        _call(
+            "add_weigh_in_with_timestamps",
+            weight_kg,
+            "kg",
+            local.replace(tzinfo=None).isoformat(timespec="seconds"),
+            gmt.replace(tzinfo=None).isoformat(timespec="seconds"),
+        )
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -593,8 +899,20 @@ def garmin_delete_workout(workout_id: str) -> str:
     return _dump({"deleted": workout_id, "result": _call("delete_workout", workout_id)})
 
 
+def _safe_sync() -> None:
+    """After sign-in: refresh today/yesterday, then backfill a month in the background
+    (stored days are skipped) so trends and recent dates answer instantly."""
+    try:
+        syncer.sync_recent()
+        syncer.start_backfill(30)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[garmin] sync failed: {str(exc)[:200]}", flush=True)
+
+
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
+    # Hourly background refresh (and token keep-alive) for as long as the server runs.
+    syncer.start_scheduler(lambda: bool(_token))
     # Access logs are suppressed via log_level=WARNING (see FastMCP config above) so the
     # secret-bearing request path is never written to logs.
     print(f"Garmin MCP serving Streamable HTTP at /<secret>/mcp on :{PORT}", flush=True)
