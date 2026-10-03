@@ -9,11 +9,14 @@ Auth model
 ----------
 Garmin has no self-serve individual API, so this server authenticates AS the account
 owner using the maintained `garminconnect` library (0.3.x, curl_cffi transport). Provide
-a long-lived token blob via the GARMIN_TOKENS env var (mint it once with auth_setup.py).
-The token auto-refreshes and lasts ~1 year. If it ever expires you can re-mint locally,
-or use the in-app tools (garmin_auth_start / garmin_auth_complete), which return a fresh
-blob to paste back into GARMIN_TOKENS. The server keeps no database — it is a stateless
-pass-through, and the only persisted secret is that env var.
+a token, either by signing in from Claude (garmin_auth_start / garmin_auth_complete) or by
+seeding the GARMIN_TOKENS env var once (mint it with auth_setup.py).
+
+Garmin rotates the refresh token every time the session refreshes, so the *current* token
+must be saved each time it changes — otherwise a restart reloads a used-up token and the
+user has to sign in again. The server therefore keeps the live token in a file on a Railway
+volume (GARMIN_TOKEN_PATH, default /data/garmin_tokens.json), loads it on boot, and lets
+the library re-save it on every refresh. GARMIN_TOKENS is only a first-boot seed.
 
 Connector security
 ------------------
@@ -42,8 +45,15 @@ from starlette.responses import JSONResponse
 # --------------------------------------------------------------------------- #
 PORT = int(os.getenv("PORT", "8000"))
 SECRET = os.getenv("GARMIN_MCP_SECRET", "").strip()
-# Primary auth: a token blob minted with auth_setup.py (or refreshed via the auth tools).
+# First-boot seed only: a token blob minted with auth_setup.py. The live token is kept in
+# TOKEN_PATH, because Garmin rotates refresh tokens and a static env blob goes stale.
 ENV_TOKENS = os.getenv("GARMIN_TOKENS", "").strip()
+# Where the live token is persisted. Point it at a Railway volume so it survives restarts.
+TOKEN_PATH = os.getenv("GARMIN_TOKEN_PATH", "").strip() or (
+    "/data/garmin_tokens.json" if os.path.isdir("/data") else ""
+)
+# Optional IANA zone (e.g. "Australia/Brisbane") so "today" means the user's day, not UTC.
+LOCAL_TZ = os.getenv("LOCAL_TIMEZONE", "").strip()
 
 if not SECRET:
     # Fail loudly rather than silently exposing an open endpoint to health data.
@@ -89,10 +99,62 @@ class NotAuthenticated(Exception):
 
 
 _client: Garmin | None = None
-_token: str = ENV_TOKENS
-_pending: dict[str, Any] = {}  # holds Garmin instance + client_state between MFA steps
+_pending: dict[str, Any] = {}  # holds the Garmin instance between MFA steps
 _state_lock = threading.Lock()  # guards _client / _token / _pending mutations
 _call_lock = threading.RLock()  # serializes access to the (non-thread-safe) HTTP client
+
+
+def _persistent() -> bool:
+    """True when a writable token file is configured (i.e. sign-ins survive restarts)."""
+    if not TOKEN_PATH:
+        return False
+    try:
+        os.makedirs(os.path.dirname(TOKEN_PATH) or ".", exist_ok=True)
+        return os.access(os.path.dirname(TOKEN_PATH) or ".", os.W_OK)
+    except OSError:
+        return False
+
+
+def _read_token_file() -> str:
+    if TOKEN_PATH and os.path.isfile(TOKEN_PATH):
+        try:
+            with open(TOKEN_PATH, encoding="utf-8") as fh:
+                return fh.read().strip()
+        except OSError:
+            return ""
+    return ""
+
+
+def _initial_token() -> str:
+    """Saved token first (it is the most recent); fall back to the env seed."""
+    return _read_token_file() or ENV_TOKENS
+
+
+_token: str = _initial_token()
+
+
+def _bind_persistence(g: Garmin) -> None:
+    """Save the client's current token and have the library re-save it on every refresh."""
+    if not _persistent():
+        return
+    try:
+        g.client._tokenstore_path = TOKEN_PATH  # library auto-dumps here after refreshes
+        g.client.dump(TOKEN_PATH)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[garmin] could not persist token: {type(exc).__name__}", flush=True)
+
+
+def _remember(g: Garmin) -> None:
+    """Keep the in-memory copy of the token current (it rotates on refresh), so a
+    reconnect never falls back to a used-up token even without a volume."""
+    global _token
+    try:
+        current = g.client.dumps()
+    except Exception:  # noqa: BLE001
+        return
+    if current and current != _token:
+        with _state_lock:
+            _token = current
 
 
 def _connect() -> Garmin:
@@ -103,38 +165,69 @@ def _connect() -> Garmin:
             "with garmin_auth_complete."
         )
     client = Garmin()
-    client.login(_token)  # login() accepts the token blob directly when > 512 chars
+    client.login(_token)  # accepts the token JSON directly
+    _bind_persistence(client)
+    _remember(client)
     return client
 
 
 def gc() -> Garmin:
     global _client
     with _state_lock:
-        if _client is None:
-            _client = _connect()
-        return _client
+        client = _client
+    if client is None:
+        client = _connect()
+        with _state_lock:
+            _client = client
+    return client
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    msg = f"{type(exc).__name__} {exc}".lower()
+    return any(k in msg for k in ("401", "unauthorized", "authentication", "token", "login"))
 
 
 def _call(fn_name: str, *args: Any, **kwargs: Any) -> Any:
-    """Call a Garmin client method under a serializing lock, retrying once with a fresh
-    login on auth errors. Serialization protects the shared curl_cffi session from
-    concurrent tool calls."""
-    global _client
+    """Call a Garmin client method under a serializing lock. On an auth error, rebuild
+    the client once from the newest saved token. Serialization protects the shared
+    curl_cffi session from concurrent tool calls."""
+    global _client, _token
     with _call_lock:
         try:
-            return getattr(gc(), fn_name)(*args, **kwargs)
+            client = gc()
+            result = getattr(client, fn_name)(*args, **kwargs)
+            _remember(client)
+            return result
         except NotAuthenticated:
             raise
         except Exception as exc:  # noqa: BLE001
-            msg = str(exc).lower()
-            if any(k in msg for k in ("401", "unauthorized", "token", "login", "auth")):
-                with _state_lock:
-                    _client = None
-                return getattr(gc(), fn_name)(*args, **kwargs)
-            raise
+            if not _is_auth_error(exc):
+                raise
+            with _state_lock:
+                _client = None
+                _token = _read_token_file() or _token
+            try:
+                client = gc()
+                result = getattr(client, fn_name)(*args, **kwargs)
+                _remember(client)
+                return result
+            except Exception as exc2:  # noqa: BLE001
+                if _is_auth_error(exc2):
+                    raise NotAuthenticated(
+                        "The Garmin session has expired. Sign in again with "
+                        "garmin_auth_start (and garmin_auth_complete if Garmin sends a code)."
+                    ) from exc2
+                raise
 
 
 def _today() -> str:
+    if LOCAL_TZ:
+        try:
+            from zoneinfo import ZoneInfo
+
+            return datetime.now(ZoneInfo(LOCAL_TZ)).date().isoformat()
+        except Exception:  # noqa: BLE001 — bad zone name or no tzdata: fall back
+            pass
     return date.today().isoformat()
 
 
@@ -153,23 +246,31 @@ def _dump(obj: Any, max_chars: int = 60_000) -> str:
 def garmin_auth_status() -> str:
     """Report whether the server is connected to a Garmin account (and whose). Call this
     first if other tools report the server isn't authenticated."""
+    persistent = _persistent()
     if not _token:
         return _dump(
             {
                 "authenticated": False,
+                "sign_in_persists": persistent,
                 "hint": "Call garmin_auth_start with the account owner's Garmin email "
                 "and password to connect.",
             }
         )
     try:
         name = _call("get_full_name")
+    except NotAuthenticated as exc:
+        return _dump({"authenticated": False, "sign_in_persists": persistent, "hint": str(exc)})
     except Exception as exc:  # noqa: BLE001
         return _dump({"authenticated": True, "warning": f"token present but test call failed: {exc}"})
     return _dump(
         {
             "authenticated": True,
             "account": name,
-            "persisted": bool(ENV_TOKENS),  # True only if backed by the GARMIN_TOKENS env var
+            "sign_in_persists": persistent,
+            **({} if persistent else {
+                "warning": "No token volume configured: this sign-in is lost on the next "
+                "restart. Attach a Railway volume at /data."
+            }),
         }
     )
 
@@ -186,13 +287,13 @@ def garmin_auth_start(email: str, password: str) -> str:
     global _pending
     try:
         g = Garmin(email, password, return_on_mfa=True)
-        status, client_state = g.login()
+        status, _ = g.login()
     except Exception as exc:  # noqa: BLE001
         return _dump({"ok": False, "error": str(exc)})
 
-    if status:  # MFA required — hold this session for the completion step
+    if status == "needs_mfa":  # hold this session (its MFA state lives on the instance)
         with _state_lock:
-            _pending = {"garmin": g, "state": client_state}
+            _pending = {"garmin": g}
         return _dump(
             {
                 "ok": True,
@@ -211,14 +312,15 @@ def garmin_auth_complete(mfa_code: str) -> str:
     Only needed after garmin_auth_start reported mfa_required."""
     global _pending
     with _state_lock:
-        pending = dict(_pending)
-    g = pending.get("garmin")
-    state = pending.get("state")
-    if not g or state is None:
+        g = _pending.get("garmin")
+    if not g:
         return _dump({"ok": False, "error": "No pending login. Call garmin_auth_start first."})
     try:
-        g.resume_login(state, mfa_code.strip())
+        # Recent garminconnect keeps the MFA state on the instance and ignores this
+        # argument; older versions returned it from login(). Passing {} works for both.
+        g.resume_login({}, mfa_code.strip().replace(" ", ""))
     except Exception as exc:  # noqa: BLE001
+        # A wrong code leaves the pending session usable for another try.
         return _dump({"ok": False, "error": f"MFA verification failed: {exc}"})
     with _state_lock:
         _pending = {}
@@ -226,13 +328,11 @@ def garmin_auth_complete(mfa_code: str) -> str:
 
 
 def _activate_and_report(g: Garmin) -> str:
-    """Make a freshly logged-in client the active one and return the token blob so the
-    user can persist it into the GARMIN_TOKENS env var (survives restarts)."""
+    """Make a freshly logged-in client the active one and save its token, so the
+    sign-in survives restarts and the user never has to paste anything."""
     global _client, _token
-    token = g.client.dumps()
-    # The MFA resume path can skip the profile fetch, leaving display_name unset —
-    # which breaks endpoints (steps, body battery) that build URLs from it. Load it
-    # explicitly so the live session works immediately, not just after a restart.
+    # The return_on_mfa login path skips the profile fetch, leaving display_name unset —
+    # which breaks endpoints (steps, body battery) that build URLs from it.
     name = None
     try:
         if not getattr(g, "display_name", None):
@@ -240,17 +340,36 @@ def _activate_and_report(g: Garmin) -> str:
         name = g.get_full_name()
     except Exception:  # noqa: BLE001
         pass
+    g.password = None
+    token = g.client.dumps()
+    _bind_persistence(g)
     with _state_lock:
         _token = token
         _client = g
+
+    if _persistent():
+        return _dump(
+            {
+                "ok": True,
+                "connected": True,
+                "account": name,
+                "saved": True,
+                "note": "Signed in and saved on the server; it stays connected across "
+                "restarts. Nothing to copy.",
+            }
+        )
+    # Without a volume the only way to survive a restart is the env var, so hand the
+    # token back — but say plainly that a volume is the real fix.
     return _dump(
         {
             "ok": True,
             "connected": True,
             "account": name,
+            "saved": False,
             "token": token,
-            "action_required": "To survive server restarts, paste this token as the "
-            "GARMIN_TOKENS variable in Railway. Until then it lives in memory only.",
+            "action_required": "No token volume is configured, so this sign-in is lost on "
+            "the next restart. Fix: attach a Railway volume mounted at /data (the server "
+            "then saves the token itself). Stopgap: paste this token into GARMIN_TOKENS.",
         }
     )
 
@@ -345,9 +464,35 @@ def garmin_weight_trend(startdate: str, enddate: str | None = None) -> str:
 @mcp.tool()
 def garmin_log_weight(weight_kg: float, when: str | None = None) -> str:
     """Log a manual weigh-in to Garmin Connect. weight_kg in kilograms; 'when' optional
-    ISO datetime 'YYYY-MM-DDTHH:MM:SS' (defaults to now). Returns the created record."""
-    ts = when or datetime.now().isoformat()
-    return _dump(_call("add_weigh_in", weight_kg, "kg", ts))
+    local ISO datetime 'YYYY-MM-DDTHH:MM:SS' (defaults to now). Returns the created record."""
+    from datetime import timezone
+
+    tz = None
+    if LOCAL_TZ:
+        try:
+            from zoneinfo import ZoneInfo
+
+            tz = ZoneInfo(LOCAL_TZ)
+        except Exception:  # noqa: BLE001
+            tz = None
+    try:
+        local = datetime.fromisoformat(when) if when else datetime.now(tz)
+    except ValueError:
+        return _dump({"error": "when must be 'YYYY-MM-DDTHH:MM:SS'"})
+    if local.tzinfo is None:
+        local = local.replace(tzinfo=tz) if tz else local.astimezone()
+    gmt = local.astimezone(timezone.utc)
+    # Explicit local + GMT stamps: the library's own conversion uses the server's
+    # clock zone (UTC on Railway), which would shift the weigh-in by the UTC offset.
+    return _dump(
+        _call(
+            "add_weigh_in_with_timestamps",
+            weight_kg,
+            "kg",
+            local.replace(tzinfo=None).isoformat(timespec="seconds"),
+            gmt.replace(tzinfo=None).isoformat(timespec="seconds"),
+        )
+    )
 
 
 # --------------------------------------------------------------------------- #
