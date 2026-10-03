@@ -32,10 +32,13 @@ from __future__ import annotations
 import json
 import os
 import threading
-from datetime import date, datetime
+import time
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from garminconnect import Garmin
+
+from cache import FRESH_MINUTES, Store, Syncer
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -51,6 +54,11 @@ ENV_TOKENS = os.getenv("GARMIN_TOKENS", "").strip()
 # Where the live token is persisted. Point it at a Railway volume so it survives restarts.
 TOKEN_PATH = os.getenv("GARMIN_TOKEN_PATH", "").strip() or (
     "/data/garmin_tokens.json" if os.path.isdir("/data") else ""
+)
+# Local data store (same volume). Without a volume it falls back to memory: still fast
+# within a process, but rebuilt after each restart.
+DB_PATH = os.getenv("GARMIN_DB_PATH", "").strip() or (
+    "/data/garmin.db" if os.path.isdir("/data") else ":memory:"
 )
 # Optional IANA zone (e.g. "Australia/Brisbane") so "today" means the user's day, not UTC.
 LOCAL_TZ = os.getenv("LOCAL_TIMEZONE", "").strip()
@@ -231,6 +239,10 @@ def _today() -> str:
     return date.today().isoformat()
 
 
+store = Store(DB_PATH)
+syncer = Syncer(store, lambda name, *a, **k: _call(name, *a, **k), lambda: _today())
+
+
 def _dump(obj: Any, max_chars: int = 60_000) -> str:
     """Compact JSON with a size guard so we never blow up the context window."""
     text = json.dumps(obj, default=str, ensure_ascii=False)
@@ -346,6 +358,8 @@ def _activate_and_report(g: Garmin) -> str:
     with _state_lock:
         _token = token
         _client = g
+    # Pull today/yesterday straight away so the first questions answer from the store.
+    threading.Thread(target=_safe_sync, name="garmin-post-login-sync", daemon=True).start()
 
     if _persistent():
         return _dump(
@@ -389,69 +403,216 @@ def garmin_whoami() -> str:
 def garmin_daily_summary(cdate: str | None = None) -> str:
     """All-day summary for a date (default today): steps, calories, resting HR, stress,
     body battery, intensity minutes and body-composition snapshot. cdate = 'YYYY-MM-DD'."""
-    return _dump(_call("get_stats_and_body", cdate or _today()))
+    return _dump(syncer.daily(cdate or _today(), "summary"))
 
 
 @mcp.tool()
 def garmin_sleep(cdate: str | None = None) -> str:
     """Sleep detail for the night ending on cdate (default today): duration, stages
     (deep/light/REM/awake), sleep score, respiration and overnight HRV where available."""
-    return _dump(_call("get_sleep_data", cdate or _today()))
+    return _dump(syncer.daily(cdate or _today(), "sleep"))
 
 
 @mcp.tool()
 def garmin_hrv(cdate: str | None = None) -> str:
     """Overnight HRV data for a date (default today): last-night average, weekly average,
     status and the per-reading series. cdate = 'YYYY-MM-DD'."""
-    return _dump(_call("get_hrv_data", cdate or _today()))
+    return _dump(syncer.daily(cdate or _today(), "hrv"))
 
 
 @mcp.tool()
 def garmin_training_readiness(cdate: str | None = None) -> str:
     """Training Readiness score and its inputs (sleep, recovery time, HRV, acute load)
     for a date (default today)."""
-    return _dump(_call("get_training_readiness", cdate or _today()))
+    return _dump(syncer.daily(cdate or _today(), "readiness"))
 
 
 @mcp.tool()
 def garmin_training_status(cdate: str | None = None) -> str:
     """Training Status for a date (default today): load balance, VO2 max estimate, acute
     and chronic load, and status label (productive/maintaining/detraining/etc.)."""
-    return _dump(_call("get_training_status", cdate or _today()))
+    return _dump(syncer.daily(cdate or _today(), "training_status"))
 
 
 @mcp.tool()
 def garmin_body_battery(startdate: str, enddate: str | None = None) -> str:
     """Body Battery series between two dates (inclusive). Dates = 'YYYY-MM-DD'.
     Omit enddate for a single day."""
-    return _dump(_call("get_body_battery", startdate, enddate))
+    end = enddate or startdate
+    try:
+        d0, d1 = date.fromisoformat(startdate), date.fromisoformat(end)
+    except ValueError:
+        return _dump({"error": "dates must be YYYY-MM-DD"})
+    if d1 < d0 or (d1 - d0).days > 62:
+        return _dump(_call("get_body_battery", startdate, enddate))
+    out: list[Any] = []
+    for n in range((d1 - d0).days + 1):
+        day = (d0 + timedelta(days=n)).isoformat()
+        part = syncer.daily(day, "body_battery")
+        out.extend(part if isinstance(part, list) else [part])
+    return _dump(out)
 
 
 @mcp.tool()
 def garmin_stress(cdate: str | None = None) -> str:
     """All-day stress breakdown for a date (default today): rest/low/medium/high minutes
     and average stress level."""
-    return _dump(_call("get_all_day_stress", cdate or _today()))
+    return _dump(syncer.daily(cdate or _today(), "stress"))
 
 
 @mcp.tool()
 def garmin_recent_activities(limit: int = 10, activitytype: str | None = None) -> str:
     """Most recent activities (default 10). Optional activitytype filter, e.g. 'running',
     'strength_training', 'cycling'. Returns summary metrics per activity."""
-    return _dump(_call("get_activities", 0, limit, activitytype))
+    last = store.get_meta("last_activities_fetch", 0) or 0
+    if time.time() - last < FRESH_MINUTES * 60 and limit <= 30:
+        cached = store.recent_activities(limit, activitytype)
+        if cached:
+            return _dump(cached)
+    try:
+        items = _call("get_activities", 0, limit, activitytype) or []
+    except Exception:
+        cached = store.recent_activities(limit, activitytype)
+        if cached:
+            return _dump(cached)
+        raise
+    store.put_activities(items)
+    if not activitytype:
+        store.set_meta("last_activities_fetch", time.time())
+    return _dump(items)
 
 
 @mcp.tool()
 def garmin_activity_detail(activity_id: str, include_sets: bool = True) -> str:
     """Full detail for one activity by id, including per-set exercise data for strength
     sessions (reps, weight, exercise category) when include_sets is true."""
+    cached = store.get_detail(activity_id)
+    if cached and (cached.get("exercise_sets") is not None or not include_sets):
+        return _dump(cached)
     out: dict[str, Any] = {"activity": _call("get_activity", activity_id)}
     if include_sets:
         try:
             out["exercise_sets"] = _call("get_activity_exercise_sets", activity_id)
         except Exception as exc:  # noqa: BLE001
             out["exercise_sets_error"] = str(exc)
+    if "exercise_sets_error" not in out:
+        store.put_detail(activity_id, out)  # finished activities don't change
     return _dump(out)
+
+
+# --- Summary tools over the local store (fast; mirror the health server's) ---- #
+def _fmt_h(seconds: Any) -> str:
+    if not isinstance(seconds, (int, float)):
+        return "—"
+    return f"{int(seconds // 3600)}h {int(round(seconds % 3600 / 60)):02d}m"
+
+
+def _f(v: Any, digits: int = 0) -> str:
+    return f"{v:.{digits}f}" if isinstance(v, (int, float)) else "—"
+
+
+def _pretty(v: Any) -> str:
+    return v.replace("_", " ").lower() if isinstance(v, str) else "—"
+
+
+def _ensure_days(days: list[str]) -> None:
+    """Fill any of these days that aren't stored yet (uses stored copies where fresh)."""
+    for day in days:
+        for source in ("summary", "sleep", "hrv", "readiness", "training_status"):
+            try:
+                syncer.daily(day, source)
+            except NotAuthenticated:
+                raise
+            except Exception:  # noqa: BLE001 — a missing metric shouldn't sink the summary
+                pass
+
+
+@mcp.tool()
+def garmin_today() -> str:
+    """Today's snapshot: training readiness, last night's sleep (score, stages), overnight
+    HRV vs baseline, resting HR, Body Battery, stress, steps, training status/load. Use
+    this for 'how am I today / should I train' questions."""
+    today = _today()
+    _ensure_days([today])
+    rows = store.daily_range(today, today)
+    if not rows:
+        return "No Garmin data for today yet."
+    r = rows[0]
+    out = [f"# Garmin — {today}", ""]
+    out.append(f"**Readiness:** {_f(r['readiness_score'])} ({_pretty(r['readiness_level'])})"
+               + (f" · {_pretty(r['readiness_feedback'])}" if r["readiness_feedback"] else ""))
+    out.append(f"**Sleep:** {_fmt_h(r['sleep_s'])} · score {_f(r['sleep_score'])} ({_pretty(r['sleep_quality'])}) — "
+               f"deep {_fmt_h(r['deep_s'])}, light {_fmt_h(r['light_s'])}, REM {_fmt_h(r['rem_s'])}, awake {_fmt_h(r['awake_s'])}")
+    out.append(f"**HRV:** {_f(r['hrv_last_night'])} ms (7-day {_f(r['hrv_weekly'])}, baseline "
+               f"{_f(r['hrv_baseline_low'])}–{_f(r['hrv_baseline_high'])}) · {_pretty(r['hrv_status'])}")
+    out.append(f"**Resting HR:** {_f(r['resting_hr'])} bpm · **Body Battery:** wake {_f(r['bb_wake'])}, "
+               f"high {_f(r['bb_high'])}, low {_f(r['bb_low'])}")
+    out.append(f"**Stress avg:** {_f(r['stress_avg'])} · **Steps:** {_f(r['steps'])} · **Active kcal:** {_f(r['active_kcal'])}")
+    if r["training_status"] or r["load_acute"] is not None:
+        out.append(f"**Training:** {_pretty(r['training_status'])} · acute {_f(r['load_acute'])} / chronic "
+                   f"{_f(r['load_chronic'])} (ratio {_f(r['acwr'], 2)})"
+                   + (f" · VO2 max {_f(r['vo2max'], 1)}" if r["vo2max"] else ""))
+    return "\n".join(out)
+
+
+@mcp.tool()
+def garmin_trends(days: int = 14) -> str:
+    """Day-by-day trends with averages: readiness, overnight HRV, resting HR, sleep
+    duration and score, Body Battery high, stress, steps. days = 1-365 (default 14).
+    Long ranges answer instantly once garmin_sync has backfilled them."""
+    days = max(1, min(int(days), 365))
+    t = date.fromisoformat(_today())
+    span = [(t - timedelta(days=n)).isoformat() for n in range(days)]
+    have = {r["date"] for r in store.daily_range(span[-1], span[0])}
+    recent = (t - timedelta(days=1)).isoformat()
+    # Today/yesterday are kept fresh by the hourly sync; only older gaps need fetching.
+    missing = [d for d in span if d not in have or d >= recent]
+    gaps = [d for d in missing if d < recent]
+    if len(gaps) > 3:
+        syncer.start_backfill(days)
+        return (f"{len(gaps)} of those days aren't stored yet, so I've started a background "
+                f"backfill (~{len(gaps) * 8 // 60 + 1} min). Showing what's stored now; ask again shortly.\n\n"
+                + _trends_table(store.daily_range(span[-1], span[0]), days))
+    _ensure_days(missing)
+    return _trends_table(store.daily_range(span[-1], span[0]), days)
+
+
+def _trends_table(rows: list[dict[str, Any]], days: int) -> str:
+    if not rows:
+        return "No stored data for that range yet."
+    lines = [f"# Garmin trends — last {days} days", "",
+             "| Date | Ready | HRV | RHR | Sleep | Score | BB high | Stress | Steps |",
+             "|---|---|---|---|---|---|---|---|---|"]
+    for r in rows:
+        lines.append(f"| {r['date']} | {_f(r['readiness_score'])} | {_f(r['hrv_last_night'])} | {_f(r['resting_hr'])} | "
+                     f"{_fmt_h(r['sleep_s'])} | {_f(r['sleep_score'])} | {_f(r['bb_high'])} | {_f(r['stress_avg'])} | {_f(r['steps'])} |")
+
+    def avg(k: str) -> float | None:
+        v = [r[k] for r in rows if isinstance(r[k], (int, float))]
+        return sum(v) / len(v) if v else None
+
+    lines.append("")
+    lines.append(f"**Averages:** readiness {_f(avg('readiness_score'))} · HRV {_f(avg('hrv_last_night'))} ms · "
+                 f"RHR {_f(avg('resting_hr'))} · sleep {_fmt_h(avg('sleep_s'))} (score {_f(avg('sleep_score'))}) · "
+                 f"stress {_f(avg('stress_avg'))} · steps {_f(avg('steps'))}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def garmin_sync(days: int | None = None) -> str:
+    """Refresh stored Garmin data. No days: refresh today/yesterday now and report status.
+    days > 2: start a background backfill of that many days (max 730) so trends and older
+    dates answer instantly; call again with no days to see progress."""
+    if days and days > 2:
+        st = syncer.start_backfill(min(int(days), 730))
+        return _dump({"backfill": st, "note": "Runs in the background (~8 s per day). Call garmin_sync with no days to check progress."})
+    bf = syncer.backfill
+    if bf.get("running"):
+        return _dump({"backfill": bf, "note": "Backfill running; stored data is usable meanwhile."})
+    result = syncer.sync_recent()
+    lo, hi = store.stored_range()
+    return _dump({"synced": result, "stored_range": [lo, hi], "last_backfill": bf if bf.get("total") else None,
+                  "store": "volume" if DB_PATH != ":memory:" else "memory (attach a /data volume to keep it)"})
 
 
 @mcp.tool()
@@ -738,8 +899,20 @@ def garmin_delete_workout(workout_id: str) -> str:
     return _dump({"deleted": workout_id, "result": _call("delete_workout", workout_id)})
 
 
+def _safe_sync() -> None:
+    """After sign-in: refresh today/yesterday, then backfill a month in the background
+    (stored days are skipped) so trends and recent dates answer instantly."""
+    try:
+        syncer.sync_recent()
+        syncer.start_backfill(30)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[garmin] sync failed: {str(exc)[:200]}", flush=True)
+
+
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
+    # Hourly background refresh (and token keep-alive) for as long as the server runs.
+    syncer.start_scheduler(lambda: bool(_token))
     # Access logs are suppressed via log_level=WARNING (see FastMCP config above) so the
     # secret-bearing request path is never written to logs.
     print(f"Garmin MCP serving Streamable HTTP at /<secret>/mcp on :{PORT}", flush=True)

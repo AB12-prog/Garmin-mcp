@@ -66,9 +66,16 @@ It prints a long **token blob**. Copy it.
    https://<your-app>.up.railway.app/<GARMIN_MCP_SECRET>/mcp
    ```
 
-The only stored state is the token file on the volume (`/data/garmin_tokens.json`,
-override with `GARMIN_TOKEN_PATH`). Without a volume, a sign-in lasts only until the next
-restart. A `GET /health` route returns `{"status":"ok"}` if
+Stored on the volume:
+- `/data/garmin_tokens.json` — the live Garmin token (override with `GARMIN_TOKEN_PATH`).
+- `/data/garmin.db` — a local copy of your Garmin data (override with `GARMIN_DB_PATH`).
+  The server refreshes today and yesterday every hour in the background, and backfills
+  the last 30 days after you first sign in, so tools answer from it in milliseconds
+  instead of waiting on Garmin. Older days come from the store; anything not stored yet
+  is fetched once and kept.
+
+Without a volume, sign-ins last only until the next restart and the data copy is rebuilt
+each time. No separate cron service is needed — the hourly refresh runs inside the server. A `GET /health` route returns `{"status":"ok"}` if
 you want a Railway healthcheck.
 
 ## Step 3 — Add to Claude
@@ -120,6 +127,10 @@ Single deployment = single Garmin account. To let (say) a sibling use it on your
 ## Tools
 
 **Auth** — `garmin_auth_status`, `garmin_auth_start`, `garmin_auth_complete`
+
+**Summaries (instant, from the local store)** — `garmin_today` (readiness, sleep, HRV,
+RHR, Body Battery, stress, steps, training load), `garmin_trends` (day-by-day table with
+averages), `garmin_sync` (refresh now, or `days` to backfill history)
 
 **Read** — `garmin_whoami`, `garmin_daily_summary`, `garmin_sleep`, `garmin_hrv`,
 `garmin_training_readiness`, `garmin_training_status`, `garmin_body_battery`,
